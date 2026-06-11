@@ -29,8 +29,8 @@ percentage bar.
 
 ## How to use
 
-1. Grab the `portable/` folder (or the zip from
-   [Releases](../../releases)) and put it anywhere on a Windows 10/11 PC.
+1. Download **`CoworkContextMeter-portable.zip`** from
+   [Releases](../../releases), extract it anywhere on a Windows 10/11 PC.
 2. Double-click **`CoworkContextMeter.exe`**. No installer, no admin rights,
    nothing else to download — it uses the .NET Framework already in Windows.
 3. If Windows SmartScreen warns about an unsigned download, click
@@ -70,11 +70,17 @@ No SDK needed — it compiles with the C# compiler that ships inside Windows:
 powershell -ExecutionPolicy Bypass -File .\build.ps1
 ```
 
-- `src/` — main app source (`Scanner.cs` core logic, `App.cs` WinForms UI,
-  `TestScanner.cs` test harness)
-- `portable/` — the redistributable package: prebuilt exes plus its own
-  source and build script (`Diagnose.cs` replaces the machine-specific test
-  harness with a generic diagnostic)
+- `src/` — full source: `Scanner.cs` (core logic), `App.cs` (WinForms UI),
+  `TestScanner.cs` (test harness), and `Diagnose.cs` (the generic diagnostic
+  shipped in the portable zip)
+- The [release zip](../../releases) is the prebuilt, redistributable
+  package: both exes plus its own source and build script.
 
 The source is deliberately **C# 5 only**, because that's what the built-in
 .NET Framework compiler (`csc.exe`) understands.
+
+## Contributing
+
+Found a bug? **Everyone is welcome to fix it** — open an
+[issue](../../issues) describing what went wrong, or just send a pull
+request. Small fixes, big fixes, all appreciated.
