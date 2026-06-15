@@ -3,26 +3,28 @@
 A standalone Windows app that shows **how much of the context window each of
 your Claude Cowork and Claude Code sessions has used** — in real time.
 
-Claude Code has a built-in context counter; **Claude Cowork doesn't**. This
-app fills that gap: it reads the session files Claude already writes to disk
-and shows every session's token usage as a sortable list with a color-coded
-percentage bar.
+Claude Code has a built-in context counter; the **Claude desktop app
+doesn't** surface one the same way. This app fills that gap: it reads the
+session files Claude already writes to disk and shows every session's token
+usage as a sortable list with a color-coded percentage bar.
 
-> Built by **Claude (Fable 5)** on **June 11, 2026**, in a Claude Code
-> session — including the multi-agent code reviews and the tests it had to
-> pass against real session data.
+> Built by **Claude (Fable 5)** on June 11, 2026. The **v1.1** compatibility
+> fix (for the storage changes in Claude Desktop 1.12603.1) was done by
+> **Claude (Opus 4.8)** — including the multi-agent reviews and the tests it
+> had to pass against real session data.
 
 ## Features
 
-- **All your sessions in one list** — Cowork and Claude Code side by side,
-  with title, project, model, last activity, tokens used, and **% of the
+- **All your sessions in one list** — with title, project, source
+  (Code / Cowork), model, last activity, tokens used, and **% of the
   context window** (green < 60%, amber 60–80%, red > 80%)
 - **Live sessions** are badged, and **Auto-refresh (5s)** lets you watch a
   running session's context climb while you work
 - **Double-click any session** for the full token breakdown (input / cache
   read / cache creation / output) and its context growth history
-- **Exact window detection for Cowork** — Cowork records the `[1m]`
-  million-token marker, so 200k vs 1M is detected precisely
+- **Exact 1M-window detection** — desktop-managed sessions record the `[1m]`
+  million-token marker in a state file, so 200k vs 1M is detected precisely
+  (no guessing)
 - Search, hide-empty and hide-archived filters, sortable columns
 - **Read-only by design**: opens files in shared-read mode, never locks or
   modifies them, writes nothing, no network
@@ -40,27 +42,44 @@ percentage bar.
 
 ## How it works
 
-Claude stores every session as a JSONL transcript:
+Claude stores every session as a JSONL transcript, plus (for desktop
+sessions) a small state file. The app resolves all of these per Windows user
+— no fixed paths:
 
-| Source | Location (resolved per Windows user — no fixed paths) |
+| What | Where it lives |
 |---|---|
-| Claude Code | `%USERPROFILE%\.claude\projects\` |
-| Cowork | `%APPDATA%\Claude\local-agent-mode-sessions\` |
+| Session transcripts (all kinds) | `%USERPROFILE%\.claude\projects\` |
+| Desktop session state (title, model, `[1m]` window) | `%APPDATA%\Claude\claude-code-sessions\` |
+| Legacy Cowork sessions (pre-update, sandboxed) | `%APPDATA%\Claude\local-agent-mode-sessions\` |
 
 A session's current context is the token usage recorded on its **latest
 assistant turn**: `input + cache_read + cache_creation + output` tokens —
 the same unit Claude Code's own counter uses. After a context compaction the
 number drops automatically.
 
-One caveat: Claude Code transcripts don't record whether a session has a
-200k or 1M window, so the **Auto** mode assumes 200k until usage exceeds it
-(use the window dropdown to force 1M). Cowork sessions are detected exactly.
-The percentage is the raw token share; Claude Code's own indicator may read
-slightly differently because it reserves buffer space for auto-compaction.
+**Labels (Source column).** A recent Claude Desktop update moved session
+storage and stopped sandboxing. The app handles both layouts:
 
-Under the hood it also handles Cowork's 270–470-character file paths, which
-exceed the Windows path limit that is still enabled by default — the app
-works without any registry changes.
+- **Code** — sessions whose transcript is in the shared `.claude\projects`
+  tree. Current desktop sessions land here; when a matching state file exists
+  in `claude-code-sessions`, the row is enriched with the real session title
+  and exact 1M-window detection.
+- **Cowork** — your older, pre-update sessions that still live sandboxed
+  under `local-agent-mode-sessions`.
+
+A session is never shown twice: a transcript claimed by a state file appears
+once, enriched.
+
+**Window caveat.** A pure command-line Claude Code session doesn't record
+whether its window is 200k or 1M, so **Auto** mode assumes 200k until usage
+exceeds it (use the window dropdown to force 1M). Sessions with a desktop
+state file are detected exactly. The percentage is the raw token share;
+Claude Code's own indicator may read slightly differently because it reserves
+buffer space for auto-compaction.
+
+Under the hood it also handles the legacy Cowork sandbox's 270–470-character
+file paths, which exceed the Windows path limit that is still off by default
+— the app works without any registry changes.
 
 ## Building from source
 
