@@ -142,8 +142,14 @@ namespace CoworkContextMeter
             int coworkCount = 0;
             SessionInfo target = null;
             string longPathExample = null;
+            int enrichedCodeCount = 0;    // "Code" rows enriched from a claude-code-sessions [1m] state file
+            string outputsProject = null; // guards the old "outputs" project-name bug
             foreach (SessionInfo s in sessions)
             {
+                if (s.ProjectName == "outputs" && outputsProject == null)
+                    outputsProject = s.SessionId;
+                if (s.Source == "Code" && s.WindowOverride == 1000000L)
+                    enrichedCodeCount++;
                 if (s.Source != "Cowork") continue;
                 coworkCount++;
                 if (s.SessionId == "7c1ca0f5-28fe-4d35-b54e-64be4634aaec") target = s;
@@ -219,6 +225,115 @@ namespace CoworkContextMeter
                         + (target.Title ?? "(null)") + "\"");
                     failures++;
                 }
+            }
+
+            // --- NEW-style Cowork assertions (claude-code-sessions root) ----
+
+            const string NewId = "4b65c900-2dba-475d-a4c5-b857ed6f16ad";
+            int newIdHits = 0;
+            SessionInfo newTarget = null;
+            foreach (SessionInfo s in sessions)
+            {
+                if (s.SessionId == NewId)
+                {
+                    newIdHits++;
+                    newTarget = s;
+                }
+            }
+
+            if (newIdHits == 1)
+            {
+                Console.WriteLine("PASS: new-style session " + NewId
+                    + " appears EXACTLY ONCE (dedup proof)");
+            }
+            else
+            {
+                Console.WriteLine(string.Format(CultureInfo.InvariantCulture,
+                    "FAIL: new-style session {0} appears {1} time(s), expected exactly 1 (dedup)",
+                    NewId, newIdHits));
+                failures++;
+            }
+
+            if (newTarget == null)
+            {
+                Console.WriteLine("FAIL: new-style session " + NewId + " not found");
+                failures++;
+            }
+            else
+            {
+                if (newTarget.Source == "Code")
+                {
+                    Console.WriteLine("PASS: " + NewId + " Source == \"Code\" (new claude-code-sessions root)");
+                }
+                else
+                {
+                    Console.WriteLine("FAIL: " + NewId + " Source expected \"Code\", got \""
+                        + (newTarget.Source ?? "(null)") + "\"");
+                    failures++;
+                }
+
+                if (newTarget.WindowOverride == 1000000L)
+                {
+                    Console.WriteLine("PASS: " + NewId
+                        + " WindowOverride == 1,000,000 (model = " + (newTarget.Model ?? "") + ")");
+                }
+                else
+                {
+                    Console.WriteLine(string.Format(CultureInfo.InvariantCulture,
+                        "FAIL: {0} WindowOverride expected 1,000,000, got {1:N0} (model = {2})",
+                        NewId, newTarget.WindowOverride, newTarget.Model ?? ""));
+                    failures++;
+                }
+
+                if (newTarget.Title == "Context window usage tracker for Cowork")
+                {
+                    Console.WriteLine("PASS: " + NewId
+                        + " title == \"Context window usage tracker for Cowork\"");
+                }
+                else
+                {
+                    Console.WriteLine("FAIL: " + NewId
+                        + " title expected \"Context window usage tracker for Cowork\", got \""
+                        + (newTarget.Title ?? "(null)") + "\"");
+                    failures++;
+                }
+
+                if (newTarget.HasUsage)
+                {
+                    Console.WriteLine(string.Format(CultureInfo.InvariantCulture,
+                        "PASS: {0} HasUsage == true (total = {1:N0})",
+                        NewId, newTarget.TotalContextTokens));
+                }
+                else
+                {
+                    Console.WriteLine("FAIL: " + NewId + " HasUsage expected true, got false");
+                    failures++;
+                }
+            }
+
+            if (enrichedCodeCount >= 2)
+            {
+                Console.WriteLine(string.Format(CultureInfo.InvariantCulture,
+                    "PASS: found {0} \"Code\" session(s) enriched with an exact 1M window from claude-code-sessions (>= 2)",
+                    enrichedCodeCount));
+            }
+            else
+            {
+                Console.WriteLine(string.Format(CultureInfo.InvariantCulture,
+                    "FAIL: expected >= 2 enriched \"Code\" sessions (WindowOverride==1,000,000), found {0}",
+                    enrichedCodeCount));
+                failures++;
+            }
+
+            if (outputsProject == null)
+            {
+                Console.WriteLine("PASS: no session has ProjectName == \"outputs\" (sandbox-cwd bug fixed)");
+            }
+            else
+            {
+                Console.WriteLine("FAIL: session " + outputsProject
+                    + " still has ProjectName == \"outputs\"");
+                failures++;
             }
 
             if (longPathExample != null)

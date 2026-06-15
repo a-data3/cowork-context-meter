@@ -77,7 +77,7 @@ namespace CoworkContextMeter
             public string Model;           // verbatim, may carry the "[1m]" suffix
             public bool IsArchived;
             public DateTime LastActivityUtc;
-            public string ProjectFolder;   // userSelectedFolders[0]
+            public string ProjectFolder;   // NEW: cwd; OLD: userSelectedFolders[0]
         }
 
         // state-file path -> parsed summary, keyed by (mtime, length): the
@@ -102,7 +102,7 @@ namespace CoworkContextMeter
             get { return Path.Combine(ClaudeDir, "projects"); }
         }
 
-        /// <summary>%APPDATA%\Claude\local-agent-mode-sessions (Cowork session storage).</summary>
+        /// <summary>%APPDATA%\Claude\local-agent-mode-sessions (OLD Cowork session storage; sandboxed sessions).</summary>
         public string CoworkSessionsDir
         {
             get
@@ -112,6 +112,23 @@ namespace CoworkContextMeter
             }
         }
 
+        /// <summary>%APPDATA%\Claude\claude-code-sessions (NEW Cowork session storage; no sandbox, transcripts in shared projects).</summary>
+        public string CoworkSessionsDirNew
+        {
+            get
+            {
+                string appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+                return Path.Combine(appData, "Claude", "claude-code-sessions");
+            }
+        }
+
+        // Live session ids from the MAIN ~/.claude/sessions, computed once per
+        // scan. New-style Cowork sessions are no longer sandboxed, so their
+        // live state lives here (keyed by cliSessionId), not in a sandbox
+        // .claude/sessions dir.
+        private HashSet<string> _mainLiveIds =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
         /// <summary>
         /// Enumerate %USERPROFILE%\.claude\projects\*\*.jsonl and return one
         /// SessionInfo per transcript. Never throws for a single bad file.
@@ -119,15 +136,68 @@ namespace CoworkContextMeter
         public List<SessionInfo> Scan()
         {
             List<SessionInfo> results = new List<SessionInfo>();
-            ScanCode(results);
-            ScanCowork(results);
+            _mainLiveIds = LoadLiveSessionIds();
+
+            // Map cliSessionId -> shared-projects transcript path, built once
+            // from the Code enumeration. New-style Cowork state files (which
+            // no longer sandbox) resolve their transcript through this map.
+            Dictionary<string, string> sharedTranscripts = BuildSharedTranscriptMap();
+
+            // Cowork pass runs FIRST so the set of cliSessionIds it claims is
+            // known before Code rows are added. A new-style Cowork transcript
+            // also lives in shared projects, so the Code pass must skip any id
+            // a Cowork state file already claimed -- otherwise the session
+            // would appear twice (one Code row + one Cowork row).
+            HashSet<string> coworkClaimed =
+                new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            ScanCowork(results, sharedTranscripts, coworkClaimed);
+            ScanCode(results, coworkClaimed);
             return results;
         }
 
-        private void ScanCode(List<SessionInfo> results)
+        /// <summary>
+        /// Enumerate every transcript under %USERPROFILE%\.claude\projects and
+        /// map its cliSessionId (= file name without ".jsonl") to its path.
+        /// Used to resolve new-style Cowork sessions, whose transcripts live in
+        /// this shared location rather than inside a sandbox home.
+        /// </summary>
+        private Dictionary<string, string> BuildSharedTranscriptMap()
+        {
+            Dictionary<string, string> map =
+                new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+            string projectsDir = ProjectsDir;
+            if (!Directory.Exists(projectsDir))
+                return map;
+
+            string[] dirs;
+            try { dirs = Directory.GetDirectories(projectsDir); }
+            catch { return map; }
+
+            foreach (string dir in dirs)
+            {
+                string[] files;
+                try { files = Directory.GetFiles(dir, "*.jsonl"); }
+                catch { continue; }
+
+                foreach (string file in files)
+                {
+                    try
+                    {
+                        string id = Path.GetFileNameWithoutExtension(file);
+                        if (!string.IsNullOrEmpty(id) && !map.ContainsKey(id))
+                            map[id] = file;
+                    }
+                    catch { }
+                }
+            }
+            return map;
+        }
+
+        private void ScanCode(List<SessionInfo> results, HashSet<string> coworkClaimed)
         {
             Dictionary<string, string> historyTitles = LoadHistoryTitles();
-            HashSet<string> liveIds = LoadLiveSessionIds();
+            HashSet<string> liveIds = _mainLiveIds;
 
             string projectsDir = ProjectsDir;
             if (!Directory.Exists(projectsDir))
@@ -147,6 +217,11 @@ namespace CoworkContextMeter
                 {
                     try
                     {
+                        // DEDUP: a transcript already claimed by a Cowork state
+                        // file is shown as a Cowork row, never also as Code.
+                        string idDedup = Path.GetFileNameWithoutExtension(file);
+                        if (idDedup != null && coworkClaimed.Contains(idDedup)) continue;
+
                         CacheEntry entry = GetOrParse(file);
                         if (entry == null || entry.Info == null) continue;
                         // Publish a per-scan copy: on a cache hit the cached
@@ -178,15 +253,33 @@ namespace CoworkContextMeter
         // ----- Cowork (desktop app local agent mode) ------------------------
 
         /// <summary>
-        /// Scan %APPDATA%\Claude\local-agent-mode-sessions\&lt;workspace&gt;\&lt;container&gt;\
-        /// for local_&lt;id&gt;.json state files. Each one that carries a
-        /// cliSessionId becomes a session row; its transcript (if present)
-        /// lives inside the sandbox home next to the state file, behind a
-        /// 270-460 char path that needs \\?\ long-path routing.
+        /// Scan both Cowork state-file roots for local_&lt;id&gt;.json files under
+        /// &lt;workspace&gt;\&lt;container&gt;\. Two storage layouts coexist:
+        ///   OLD (local-agent-mode-sessions): sandboxed; the transcript lives
+        ///        inside the sandbox home next to the state file, behind a
+        ///        270-460 char path that needs \\?\ long-path routing.
+        ///   NEW (claude-code-sessions): no sandbox; the transcript lives in
+        ///        the shared %USERPROFILE%\.claude\projects folder and is
+        ///        resolved through <paramref name="sharedTranscripts"/> by
+        ///        cliSessionId.
+        /// Every cliSessionId turned into a row is added to
+        /// <paramref name="claimed"/> so the Code pass can de-dup against it.
         /// </summary>
-        private void ScanCowork(List<SessionInfo> results)
+        private void ScanCowork(List<SessionInfo> results,
+            Dictionary<string, string> sharedTranscripts, HashSet<string> claimed)
         {
-            string root = CoworkSessionsDir;
+            // OLD local-agent-mode-sessions = legacy sandboxed Cowork runs -> "Cowork".
+            // NEW claude-code-sessions = ordinary desktop Claude Code sessions whose
+            // transcripts live in the shared ~/.claude/projects tree -> "Code"
+            // (just enriched with the state file's real title + exact [1m] window).
+            ScanCoworkRoot(CoworkSessionsDir, "Cowork", results, sharedTranscripts, claimed);
+            ScanCoworkRoot(CoworkSessionsDirNew, "Code", results, sharedTranscripts, claimed);
+        }
+
+        /// <summary>Walk one &lt;root&gt;\&lt;workspace&gt;\&lt;container&gt;\local_*.json tree, labeling rows <paramref name="source"/>.</summary>
+        private void ScanCoworkRoot(string root, string source, List<SessionInfo> results,
+            Dictionary<string, string> sharedTranscripts, HashSet<string> claimed)
+        {
             try { if (!Directory.Exists(Lp(root))) return; }
             catch { return; }
 
@@ -212,8 +305,14 @@ namespace CoworkContextMeter
                     {
                         try
                         {
-                            SessionInfo info = BuildCoworkSession(StripLp(sfRaw));
-                            if (info != null) results.Add(info);
+                            SessionInfo info =
+                                BuildCoworkSession(StripLp(sfRaw), source, sharedTranscripts);
+                            if (info != null)
+                            {
+                                results.Add(info);
+                                if (!string.IsNullOrEmpty(info.SessionId))
+                                    claimed.Add(info.SessionId);
+                            }
                         }
                         catch
                         {
@@ -224,8 +323,9 @@ namespace CoworkContextMeter
             }
         }
 
-        /// <summary>One SessionInfo per valid state file; transcript-less sessions still get a row.</summary>
-        private SessionInfo BuildCoworkSession(string stateFile)
+        /// <summary>One SessionInfo per valid state file, labeled <paramref name="source"/>; transcript-less sessions still get a row.</summary>
+        private SessionInfo BuildCoworkSession(string stateFile, string source,
+            Dictionary<string, string> sharedTranscripts)
         {
             CoworkState st = GetOrParseCoworkState(stateFile);
             if (st == null || !st.Valid) return null;
@@ -235,7 +335,18 @@ namespace CoworkContextMeter
 
             SessionInfo info = null;
             string fallbackTitle = null;
+            // OLD layout: transcript inside the sandbox home (when it exists).
+            // NEW layout: no sandbox -> resolve via the shared-projects map by
+            // cliSessionId. Try the sandbox first for back-compat, then fall
+            // back to the shared map.
             string transcript = FindCoworkTranscript(sandboxDir, st.CliSessionId);
+            if (transcript == null && sharedTranscripts != null &&
+                !string.IsNullOrEmpty(st.CliSessionId))
+            {
+                string shared;
+                if (sharedTranscripts.TryGetValue(st.CliSessionId, out shared))
+                    transcript = shared;
+            }
             if (transcript != null)
             {
                 CacheEntry entry = GetOrParse(transcript);
@@ -256,7 +367,7 @@ namespace CoworkContextMeter
                 info.LastActivityUtc = st.LastActivityUtc;
             }
 
-            info.Source = "Cowork";
+            info.Source = source;
             info.IsArchived = st.IsArchived;
 
             // the state file records the [1m] 1M-window marker that transcripts lack
@@ -272,7 +383,12 @@ namespace CoworkContextMeter
             info.Title = title;
 
             string leaf = LeafName(st.ProjectFolder);
-            info.ProjectName = string.IsNullOrEmpty(leaf) ? "Cowork" : leaf;
+            if (!string.IsNullOrEmpty(leaf))
+                info.ProjectName = leaf;
+            else if (IsSandboxPath(info.Cwd))
+                // the transcript-derived project name came from a sandbox cwd
+                // (e.g. "outputs") -> not a real project, so blank it.
+                info.ProjectName = "";
             if (!string.IsNullOrEmpty(st.ProjectFolder)) info.Cwd = st.ProjectFolder;
 
             if (st.LastActivityUtc > info.LastActivityUtc)
@@ -281,8 +397,14 @@ namespace CoworkContextMeter
             // each sandbox home has its own .claude\sessions\<pid>.json dir
             HashSet<string> live = LoadLiveSessionIdsFrom(
                 Path.Combine(sandboxDir, Path.Combine(".claude", "sessions")));
-            info.IsLive = live.Contains(st.CliSessionId) ||
-                (st.CoworkSessionId != null && live.Contains(st.CoworkSessionId));
+            // OLD-style sessions are live via their sandbox .claude/sessions;
+            // NEW-style sessions (no sandbox) are live via the main
+            // ~/.claude/sessions, keyed by cliSessionId. Check both.
+            info.IsLive =
+                (st.CliSessionId != null && live.Contains(st.CliSessionId)) ||
+                (st.CoworkSessionId != null && live.Contains(st.CoworkSessionId)) ||
+                (st.CliSessionId != null && _mainLiveIds.Contains(st.CliSessionId)) ||
+                (st.CoworkSessionId != null && _mainLiveIds.Contains(st.CoworkSessionId));
             return info;
         }
 
@@ -365,9 +487,22 @@ namespace CoworkContextMeter
                     st.IsArchived = arch is bool && (bool)arch;
                     long ms = ToLong(GetField(obj, "lastActivityAt"));
                     if (ms > 0) st.LastActivityUtc = Epoch.AddMilliseconds((double)ms);
+                    // OLD schema's userSelectedFolders[0] is the REAL project
+                    // folder; its "cwd" points at the sandbox
+                    // "...\local_<id>\outputs" dir (which would wrongly show
+                    // "outputs" as the project). NEW schema has no
+                    // userSelectedFolders and its "cwd" IS the real folder.
+                    // So prefer userSelectedFolders, fall back to cwd.
                     object[] folders = GetField(obj, "userSelectedFolders") as object[];
                     if (folders != null && folders.Length > 0)
                         st.ProjectFolder = folders[0] as string;
+                    if (string.IsNullOrEmpty(st.ProjectFolder))
+                    {
+                        string cwdVal = GetString(obj, "cwd");
+                        // A sandbox cwd (".../local-agent-mode-sessions/.../outputs")
+                        // is never a real project folder -> never show "outputs".
+                        if (!IsSandboxPath(cwdVal)) st.ProjectFolder = cwdVal;
+                    }
                     // only files that carry a cliSessionId are sessions (the
                     // skills-plugin dir and other JSON never qualify)
                     st.Valid = !string.IsNullOrEmpty(st.CliSessionId);
@@ -392,6 +527,18 @@ namespace CoworkContextMeter
                 text = text.Replace("  ", " ");
             if (text.Length > 80) text = text.Substring(0, 80).TrimEnd() + "...";
             return text;
+        }
+
+        /// <summary>
+        /// True if a path lives inside a Cowork sandbox tree (its leaf is
+        /// typically "outputs"); such a path is never a real user project
+        /// folder, so it must not become a ProjectName.
+        /// </summary>
+        private static bool IsSandboxPath(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return true;
+            return path.IndexOf("\\local-agent-mode-sessions\\", StringComparison.OrdinalIgnoreCase) >= 0
+                || path.IndexOf("\\claude-code-sessions\\", StringComparison.OrdinalIgnoreCase) >= 0;
         }
 
         private static string LeafName(string path)

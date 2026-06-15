@@ -34,8 +34,10 @@ namespace CoworkContextMeter
             Console.WriteLine();
             Console.WriteLine("Data locations on THIS computer:");
 
-            bool codeRoot = ReportRoot("Claude Code sessions", scanner.ProjectsDir);
-            bool coworkRoot = ReportRoot("Cowork sessions     ", scanner.CoworkSessionsDir);
+            bool codeRoot = ReportRoot("Claude Code sessions   ", scanner.ProjectsDir);
+            bool coworkRootOld = ReportRoot("Cowork sessions (old)  ", scanner.CoworkSessionsDir);
+            bool coworkRootNew = ReportRoot("Cowork sessions (new)  ", scanner.CoworkSessionsDirNew);
+            bool coworkRoot = coworkRootOld || coworkRootNew;
             Console.WriteLine();
 
             if (!codeRoot && !coworkRoot)
