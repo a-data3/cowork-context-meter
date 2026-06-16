@@ -129,6 +129,15 @@ namespace CoworkContextMeter
         private HashSet<string> _mainLiveIds =
             new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
+        // Last good per-root Cowork rows. If a root is transiently unreadable
+        // (e.g. its folder is locked while Claude Desktop resets), reuse these
+        // instead of dropping every Cowork session from the list.
+        private readonly Dictionary<string, List<SessionInfo>> _lastCoworkRows =
+            new Dictionary<string, List<SessionInfo>>(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>True if the most recent scan reused stale Cowork rows because a root was busy.</summary>
+        public bool StaleCoworkShown;
+
         /// <summary>
         /// Enumerate %USERPROFILE%\.claude\projects\*\*.jsonl and return one
         /// SessionInfo per transcript. Never throws for a single bad file.
@@ -136,6 +145,7 @@ namespace CoworkContextMeter
         public List<SessionInfo> Scan()
         {
             List<SessionInfo> results = new List<SessionInfo>();
+            StaleCoworkShown = false;
             _mainLiveIds = LoadLiveSessionIds();
 
             // Map cliSessionId -> shared-projects transcript path, built once
@@ -276,30 +286,72 @@ namespace CoworkContextMeter
             ScanCoworkRoot(CoworkSessionsDirNew, "Code", results, sharedTranscripts, claimed);
         }
 
-        /// <summary>Walk one &lt;root&gt;\&lt;workspace&gt;\&lt;container&gt;\local_*.json tree, labeling rows <paramref name="source"/>.</summary>
+        /// <summary>
+        /// Walk one root's tree, labeling rows <paramref name="source"/>. If the
+        /// enumeration fails transiently (folder busy/locked, e.g. during a
+        /// Claude Desktop reset), reuse the previous good scan's rows for this
+        /// root rather than dropping every Cowork session from the list.
+        /// </summary>
         private void ScanCoworkRoot(string root, string source, List<SessionInfo> results,
             Dictionary<string, string> sharedTranscripts, HashSet<string> claimed)
         {
-            try { if (!Directory.Exists(Lp(root))) return; }
-            catch { return; }
+            List<SessionInfo> rows = new List<SessionInfo>();
+            bool ok = TryScanCoworkRoot(root, source, sharedTranscripts, rows);
+            if (ok)
+            {
+                _lastCoworkRows[root] = rows;
+            }
+            else
+            {
+                List<SessionInfo> prev;
+                if (_lastCoworkRows.TryGetValue(root, out prev) && prev != null && prev.Count > 0)
+                {
+                    rows = prev;             // stale-beats-empty
+                    StaleCoworkShown = true;
+                }
+                else
+                {
+                    rows = new List<SessionInfo>(); // nothing known yet -> honest empty
+                }
+            }
+
+            foreach (SessionInfo info in rows)
+            {
+                results.Add(info);
+                if (!string.IsNullOrEmpty(info.SessionId))
+                    claimed.Add(info.SessionId);
+            }
+        }
+
+        /// <summary>
+        /// Enumerate one root into <paramref name="rows"/>. Returns false if any
+        /// directory enumeration failed (root missing or threw) so the caller
+        /// can fall back to the last good rows. A single corrupt state file is
+        /// skipped and never fails the whole root.
+        /// </summary>
+        private bool TryScanCoworkRoot(string root, string source,
+            Dictionary<string, string> sharedTranscripts, List<SessionInfo> rows)
+        {
+            try { if (!Directory.Exists(Lp(root))) return false; }
+            catch { return false; }
 
             string[] wsDirs;
             try { wsDirs = Directory.GetDirectories(Lp(root)); }
-            catch { return; }
+            catch { return false; }
 
             foreach (string wsRaw in wsDirs)
             {
                 string ws = StripLp(wsRaw);
                 string[] containers;
                 try { containers = Directory.GetDirectories(Lp(ws)); }
-                catch { continue; }
+                catch { return false; }    // transient -> fail whole root, keep last good
 
                 foreach (string contRaw in containers)
                 {
                     string cont = StripLp(contRaw);
                     string[] stateFiles;
                     try { stateFiles = Directory.GetFiles(Lp(cont), "local_*.json"); }
-                    catch { continue; }
+                    catch { return false; }
 
                     foreach (string sfRaw in stateFiles)
                     {
@@ -307,12 +359,7 @@ namespace CoworkContextMeter
                         {
                             SessionInfo info =
                                 BuildCoworkSession(StripLp(sfRaw), source, sharedTranscripts);
-                            if (info != null)
-                            {
-                                results.Add(info);
-                                if (!string.IsNullOrEmpty(info.SessionId))
-                                    claimed.Add(info.SessionId);
-                            }
+                            if (info != null) rows.Add(info);
                         }
                         catch
                         {
@@ -321,6 +368,7 @@ namespace CoworkContextMeter
                     }
                 }
             }
+            return true;
         }
 
         /// <summary>One SessionInfo per valid state file, labeled <paramref name="source"/>; transcript-less sessions still get a row.</summary>

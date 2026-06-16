@@ -446,6 +446,8 @@ namespace CoworkContextMeter
                     "{0} shown of {1} sessions{2}scanned in {3} ms{2}{4}",
                     shown, _all.Count, Dot, _lastScanMs, _scanner.ProjectsDir);
             }
+            if (_scanner.StaleCoworkShown)
+                text += Dot + "⚠ Cowork folder busy — showing last known";
             _statusLabel.Text = text;
         }
 
