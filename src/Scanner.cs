@@ -166,6 +166,45 @@ namespace CoworkContextMeter
         }
 
         /// <summary>
+        /// Like Scan(), but if a Cowork root exists yet no "Cowork" rows came
+        /// back (the signature of a folder briefly locked just after a PC
+        /// restart or a Claude Desktop launch), retry up to maxTries times,
+        /// sleeping sleepMs between attempts, before settling. Used for the
+        /// FIRST scan at startup; auto-refresh keeps using plain Scan().
+        /// </summary>
+        public List<SessionInfo> ScanResilient(int maxTries, int sleepMs)
+        {
+            List<SessionInfo> list = Scan();
+            int tries = 1;
+            while (tries < maxTries && CoworkRootPresentButEmpty(list))
+            {
+                System.Threading.Thread.Sleep(sleepMs);
+                list = Scan();
+                tries++;
+            }
+            return list;
+        }
+
+        /// <summary>
+        /// True if the legacy Cowork root directory exists but the scan produced
+        /// no "Cowork"-source rows -- the signature of a transient folder lock,
+        /// not a genuinely Cowork-free machine (where the root would be absent).
+        /// </summary>
+        private bool CoworkRootPresentButEmpty(List<SessionInfo> list)
+        {
+            bool oldExists = false;
+            try { oldExists = Directory.Exists(Lp(CoworkSessionsDir)); }
+            catch { }
+            if (!oldExists) return false;
+            if (list == null) return true;
+            foreach (SessionInfo s in list)
+            {
+                if (s.Source == "Cowork") return false;
+            }
+            return true;
+        }
+
+        /// <summary>
         /// Enumerate every transcript under %USERPROFILE%\.claude\projects and
         /// map its cliSessionId (= file name without ".jsonl") to its path.
         /// Used to resolve new-style Cowork sessions, whose transcripts live in

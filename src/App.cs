@@ -61,6 +61,7 @@ namespace CoworkContextMeter
         private ToolTip _toolTip;
 
         private bool _scanning;
+        private bool _firstScan = true;
         private int _sortColumn = ColActivity;
         private bool _sortAsc = false;
         private long _lastScanMs;
@@ -256,8 +257,13 @@ namespace CoworkContextMeter
             {
                 List<SessionInfo> list = null;
                 string error = null;
+                bool first = _firstScan;
+                _firstScan = false;
                 Stopwatch sw = Stopwatch.StartNew();
-                try { list = _scanner.Scan(); }
+                // First scan retries if a Cowork folder is present but empty
+                // (folder still settling just after a PC restart / Desktop
+                // launch); auto-refresh ticks use the plain, non-blocking scan.
+                try { list = first ? _scanner.ScanResilient(10, 500) : _scanner.Scan(); }
                 catch (Exception ex) { error = ex.Message; }
                 sw.Stop();
                 long ms = sw.ElapsedMilliseconds;
