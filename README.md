@@ -8,6 +8,11 @@ Claude Code has a built-in context counter; the **Claude desktop app doesn't**
 surface one the same way. This fills that gap, showing every session's token
 usage as a sortable list with a colour-coded percentage bar.
 
+![Cowork Context Meter v2.2 showing sessions with their source, model, tokens used and percentage of the context window](docs/screenshot.png)
+
+*Session titles and project names are blacked out in this screenshot only —
+the app shows them normally.*
+
 ---
 
 ## ⚠️ Important: Cowork sessions are only readable when **cloud is disabled**
