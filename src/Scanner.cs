@@ -43,6 +43,34 @@ namespace CoworkContextMeter
         public long Total { get; set; }
     }
 
+    /// <summary>
+    /// Serializable snapshot of one Cowork-root row, persisted to a small local
+    /// cache file so a fresh launch can show the last known sessions when the
+    /// live folders are briefly unreadable (just after a Desktop update / PC
+    /// restart). Times are stored as UTC ticks to avoid time-zone drift.
+    /// </summary>
+    public class CachedRow
+    {
+        public string Root { get; set; }
+        public string SessionId { get; set; }
+        public string FilePath { get; set; }
+        public string Title { get; set; }
+        public string ProjectName { get; set; }
+        public string Cwd { get; set; }
+        public string Model { get; set; }
+        public long LastActivityTicks { get; set; }
+        public long InputTokens { get; set; }
+        public long CacheReadTokens { get; set; }
+        public long CacheCreationTokens { get; set; }
+        public long OutputTokens { get; set; }
+        public long TotalContextTokens { get; set; }
+        public bool HasUsage { get; set; }
+        public long FileSizeBytes { get; set; }
+        public string Source { get; set; }
+        public long WindowOverride { get; set; }
+        public bool IsArchived { get; set; }
+    }
+
     public class Scanner
     {
         private class CacheEntry
@@ -88,7 +116,7 @@ namespace CoworkContextMeter
         private static readonly DateTime Epoch =
             new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
 
-        public string ClaudeDir
+        public virtual string ClaudeDir
         {
             get
             {
@@ -103,7 +131,7 @@ namespace CoworkContextMeter
         }
 
         /// <summary>%APPDATA%\Claude\local-agent-mode-sessions (OLD Cowork session storage; sandboxed sessions).</summary>
-        public string CoworkSessionsDir
+        public virtual string CoworkSessionsDir
         {
             get
             {
@@ -113,13 +141,130 @@ namespace CoworkContextMeter
         }
 
         /// <summary>%APPDATA%\Claude\claude-code-sessions (NEW Cowork session storage; no sandbox, transcripts in shared projects).</summary>
-        public string CoworkSessionsDirNew
+        public virtual string CoworkSessionsDirNew
         {
             get
             {
                 string appData = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
                 return Path.Combine(appData, "Claude", "claude-code-sessions");
             }
+        }
+
+        /// <summary>
+        /// Claude Desktop ships as an MSIX (packaged) app, so it stores its data
+        /// INSIDE its package container rather than in the real %APPDATA%:
+        ///   %LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude\&lt;leaf&gt;
+        /// A process running OUTSIDE that container -- which is the normal case
+        /// for this app when the user launches it from Explorer -- sees an empty
+        /// real %APPDATA% and would find ZERO Cowork sessions. So we must scan
+        /// the package location as well. (Wildcarded: the package family name
+        /// changes when Claude Desktop is reinstalled/updated.)
+        /// </summary>
+        /// <summary>
+        /// Context window for a Cowork session, derived from the model string
+        /// in its state file. Returns 0 when unknown (the UI's Auto mode then
+        /// decides).
+        ///
+        /// Why this is not simply "[1m] -> 1M, else 200k": the Claude Code CLI
+        /// carries a per-model window table keyed by SURFACE, and the Cowork
+        /// surfaces ("local-agent" / "remote_cowork") get a SMALLER window
+        /// than everywhere else:
+        ///     claude-sonnet-5: local-agent / remote_cowork -> 500,000
+        ///                      default (other surfaces)    -> 967,000
+        /// Assuming 200k for a Cowork sonnet-5 session makes the meter read
+        /// over 100% the moment it passes 200,000 tokens -- exactly when the
+        /// number starts to matter.
+        ///
+        /// Auto-compaction then fires at (window - 33,000): a 20,000 output
+        /// reserve plus 13,000 headroom. That rule is verified three ways --
+        /// the CLI bundle, live client telemetry (1,000,000 -> 967,000 and
+        /// 967,000 -> 934,000), and 9 measured compaction events on a 200k
+        /// model (167,287-171,567). The 500,000 Cowork figure itself comes
+        /// from the bundle only, so treat it as best-known, not certain.
+        /// </summary>
+        private static long CoworkWindowFor(string model)
+        {
+            if (string.IsNullOrEmpty(model)) return 0L;
+            if (model.IndexOf("[1m]", StringComparison.Ordinal) >= 0) return 1000000L;
+            if (model.IndexOf("sonnet-5", StringComparison.OrdinalIgnoreCase) >= 0) return 500000L;
+            return 0L;   // unknown -> let the UI's Auto mode decide
+        }
+
+        /// <summary>~/.claude/jobs -- one folder per daemon-run Cowork job.</summary>
+        public virtual string JobsDir
+        {
+            get { return Path.Combine(ClaudeDir, "jobs"); }
+        }
+
+        /// <summary>
+        /// Current Cowork sessions are run by the Claude daemon as "jobs": each
+        /// gets ~/.claude/jobs/&lt;short&gt;/state.json holding its real name and the
+        /// sessionId of its transcript (which lives in the normal
+        /// ~/.claude/projects tree). They have NO state file under
+        /// claude-code-sessions, so without this they'd be mistaken for ordinary
+        /// command-line "Code" sessions and titled with their first prompt.
+        /// Returns sessionId -> job name (name may be empty).
+        /// </summary>
+        public Dictionary<string, string> LoadJobSessions()
+        {
+            Dictionary<string, string> map =
+                new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                string root = JobsDir;
+                if (!Directory.Exists(Lp(root))) return map;
+                string[] dirs;
+                try { dirs = Directory.GetDirectories(Lp(root)); }
+                catch { return map; }
+
+                JavaScriptSerializer ser = NewSerializer();
+                foreach (string dRaw in dirs)
+                {
+                    try
+                    {
+                        string state = Path.Combine(StripLp(dRaw), "state.json");
+                        if (!File.Exists(Lp(state))) continue;
+                        string text;
+                        using (FileStream fs = OpenShared(state))
+                        using (StreamReader r = new StreamReader(fs, Encoding.UTF8))
+                            text = r.ReadToEnd();
+                        Dictionary<string, object> obj =
+                            ser.DeserializeObject(text) as Dictionary<string, object>;
+                        if (obj == null) continue;
+                        string sid = GetString(obj, "sessionId");
+                        if (string.IsNullOrEmpty(sid)) continue;
+                        map[sid] = TrimTitle(GetString(obj, "name"));
+                    }
+                    catch { }
+                }
+                if (map.Count > 0) ScanLog("jobs: found " + map.Count + " daemon Cowork job(s)");
+            }
+            catch (Exception ex) { ScanLog("jobs: LOAD FAILED " + ex.GetType().Name + ": " + ex.Message); }
+            return map;
+        }
+
+        public List<string> PackageCoworkRoots(string leaf)
+        {
+            List<string> found = new List<string>();
+            try
+            {
+                string lad = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+                string pkgs = Path.Combine(lad, "Packages");
+                if (!Directory.Exists(pkgs)) return found;
+                string[] dirs;
+                try { dirs = Directory.GetDirectories(pkgs, "Claude_*"); }
+                catch { return found; }
+                foreach (string dir in dirs)
+                {
+                    string p = Path.Combine(dir,
+                        Path.Combine("LocalCache", Path.Combine("Roaming",
+                        Path.Combine("Claude", leaf))));
+                    try { if (Directory.Exists(Lp(p))) found.Add(p); }
+                    catch { }
+                }
+            }
+            catch { }
+            return found;
         }
 
         // Live session ids from the MAIN ~/.claude/sessions, computed once per
@@ -138,6 +283,190 @@ namespace CoworkContextMeter
         /// <summary>True if the most recent scan reused stale Cowork rows because a root was busy.</summary>
         public bool StaleCoworkShown;
 
+        // On-disk last-good cache so a FRESH process (e.g. opened right after a
+        // Desktop update or PC restart, while the folders are still locked) can
+        // fall back to the last known Cowork sessions instead of showing none.
+        private bool _diskLoaded;
+        private string _lastSavedSig;
+
+        protected virtual string CoworkCachePath
+        {
+            get
+            {
+                string lad = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+                return Path.Combine(lad, Path.Combine("CoworkContextMeter", "cowork-cache.json"));
+            }
+        }
+
+        // Diagnostic log shared with the UI (%LOCALAPPDATA%\CoworkContextMeter\
+        // ui-debug.log). Silent-catch blocks below used to hide WHY Cowork rows
+        // disappeared; now they say so. Never throws.
+        internal static void ScanLog(string msg)
+        {
+            try
+            {
+                string dir = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "CoworkContextMeter");
+                if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+                string path = Path.Combine(dir, "ui-debug.log");
+                try
+                {
+                    FileInfo fi = new FileInfo(path);
+                    if (fi.Exists && fi.Length > 262144) File.Delete(path);
+                }
+                catch { }
+                File.AppendAllText(path,
+                    DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture)
+                    + "  [scanner] " + msg + Environment.NewLine);
+            }
+            catch { }
+        }
+
+        /// <summary>Seed _lastCoworkRows from the on-disk cache once per Scanner.</summary>
+        private void LoadCoworkCache()
+        {
+            // Retry the load while we still have NOTHING cached: a single failed
+            // (or too-early) first read must not permanently disable the
+            // fallback for the whole life of the process.
+            if (_diskLoaded && _lastCoworkRows.Count > 0) return;
+            _diskLoaded = true;
+            try
+            {
+                string path = CoworkCachePath;
+                if (!File.Exists(path)) { ScanLog("cache MISSING at " + path); return; }
+                string text;
+                using (FileStream fs = new FileStream(path, FileMode.Open, FileAccess.Read,
+                    FileShare.ReadWrite | FileShare.Delete))
+                using (StreamReader r = new StreamReader(fs, Encoding.UTF8))
+                {
+                    text = r.ReadToEnd();
+                }
+                JavaScriptSerializer ser = NewSerializer();
+                List<CachedRow> cached = ser.Deserialize<List<CachedRow>>(text);
+                if (cached == null) return;
+
+                Dictionary<string, List<SessionInfo>> byRoot =
+                    new Dictionary<string, List<SessionInfo>>(StringComparer.OrdinalIgnoreCase);
+                foreach (CachedRow c in cached)
+                {
+                    if (c == null || string.IsNullOrEmpty(c.Root)) continue;
+                    List<SessionInfo> list;
+                    if (!byRoot.TryGetValue(c.Root, out list))
+                    {
+                        list = new List<SessionInfo>();
+                        byRoot[c.Root] = list;
+                    }
+                    list.Add(FromCached(c));
+                }
+                int seeded = 0;
+                foreach (KeyValuePair<string, List<SessionInfo>> kv in byRoot)
+                {
+                    if (kv.Value.Count > 0 && !_lastCoworkRows.ContainsKey(kv.Key))
+                    {
+                        _lastCoworkRows[kv.Key] = kv.Value;
+                        seeded += kv.Value.Count;
+                    }
+                }
+                ScanLog("cache loaded rows=" + cached.Count + " seeded=" + seeded
+                    + " roots=" + byRoot.Count);
+            }
+            catch (Exception ex)
+            {
+                ScanLog("cache LOAD FAILED: " + ex.GetType().Name + ": " + ex.Message);
+            }
+        }
+
+        /// <summary>Persist the current per-root last-good rows; debounced by a cheap signature.</summary>
+        private void SaveCoworkCache()
+        {
+            try
+            {
+                List<CachedRow> rows = new List<CachedRow>();
+                List<string> sigParts = new List<string>();
+                foreach (KeyValuePair<string, List<SessionInfo>> kv in _lastCoworkRows)
+                {
+                    if (kv.Value == null) continue;
+                    foreach (SessionInfo s in kv.Value)
+                    {
+                        rows.Add(ToCached(kv.Key, s));
+                        sigParts.Add(kv.Key + "#" + (s.SessionId ?? ""));
+                    }
+                }
+                sigParts.Sort(StringComparer.Ordinal);
+                string sig = rows.Count + "|" + string.Join(",", sigParts.ToArray());
+                if (sig == _lastSavedSig) return; // unchanged set -> skip write
+
+                JavaScriptSerializer ser = NewSerializer();
+                string text = ser.Serialize(rows);
+                string path = CoworkCachePath;
+                string dir = Path.GetDirectoryName(path);
+                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+                    Directory.CreateDirectory(dir);
+                string tmp = path + ".tmp";
+                using (FileStream fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None))
+                using (StreamWriter w = new StreamWriter(fs, new UTF8Encoding(false)))
+                {
+                    w.Write(text);
+                }
+                try { if (File.Exists(path)) File.Delete(path); }
+                catch { }
+                File.Move(tmp, path);
+                _lastSavedSig = sig;
+            }
+            catch { }
+        }
+
+        private static SessionInfo FromCached(CachedRow c)
+        {
+            SessionInfo s = new SessionInfo();
+            s.SessionId = c.SessionId;
+            s.FilePath = c.FilePath;
+            s.Title = c.Title;
+            s.ProjectName = c.ProjectName;
+            s.Cwd = c.Cwd;
+            s.Model = c.Model;
+            long t = c.LastActivityTicks;
+            s.LastActivityUtc = (t >= DateTime.MinValue.Ticks && t <= DateTime.MaxValue.Ticks)
+                ? new DateTime(t, DateTimeKind.Utc) : DateTime.MinValue;
+            s.InputTokens = c.InputTokens;
+            s.CacheReadTokens = c.CacheReadTokens;
+            s.CacheCreationTokens = c.CacheCreationTokens;
+            s.OutputTokens = c.OutputTokens;
+            s.TotalContextTokens = c.TotalContextTokens;
+            s.HasUsage = c.HasUsage;
+            s.IsLive = false; // never claim "live" from cached data
+            s.FileSizeBytes = c.FileSizeBytes;
+            s.Source = c.Source;
+            s.WindowOverride = c.WindowOverride;
+            s.IsArchived = c.IsArchived;
+            return s;
+        }
+
+        private static CachedRow ToCached(string root, SessionInfo s)
+        {
+            CachedRow c = new CachedRow();
+            c.Root = root;
+            c.SessionId = s.SessionId;
+            c.FilePath = s.FilePath;
+            c.Title = s.Title;
+            c.ProjectName = s.ProjectName;
+            c.Cwd = s.Cwd;
+            c.Model = s.Model;
+            c.LastActivityTicks = s.LastActivityUtc.Ticks;
+            c.InputTokens = s.InputTokens;
+            c.CacheReadTokens = s.CacheReadTokens;
+            c.CacheCreationTokens = s.CacheCreationTokens;
+            c.OutputTokens = s.OutputTokens;
+            c.TotalContextTokens = s.TotalContextTokens;
+            c.HasUsage = s.HasUsage;
+            c.FileSizeBytes = s.FileSizeBytes;
+            c.Source = s.Source;
+            c.WindowOverride = s.WindowOverride;
+            c.IsArchived = s.IsArchived;
+            return c;
+        }
+
         /// <summary>
         /// Enumerate %USERPROFILE%\.claude\projects\*\*.jsonl and return one
         /// SessionInfo per transcript. Never throws for a single bad file.
@@ -146,6 +475,7 @@ namespace CoworkContextMeter
         {
             List<SessionInfo> results = new List<SessionInfo>();
             StaleCoworkShown = false;
+            LoadCoworkCache();
             _mainLiveIds = LoadLiveSessionIds();
 
             // Map cliSessionId -> shared-projects transcript path, built once
@@ -247,6 +577,9 @@ namespace CoworkContextMeter
         {
             Dictionary<string, string> historyTitles = LoadHistoryTitles();
             HashSet<string> liveIds = _mainLiveIds;
+            // Daemon-run Cowork jobs: their transcripts sit in the normal
+            // projects tree, so they arrive here looking like plain Code rows.
+            Dictionary<string, string> jobs = LoadJobSessions();
 
             string projectsDir = ProjectsDir;
             if (!Directory.Exists(projectsDir))
@@ -288,6 +621,16 @@ namespace CoworkContextMeter
                         if (string.IsNullOrEmpty(title)) title = info.SessionId;
                         info.Title = title;
 
+                        // A transcript owned by a daemon job IS a Cowork session:
+                        // relabel it and prefer the job's real name over the
+                        // first-prompt fallback title.
+                        string jobName;
+                        if (info.SessionId != null && jobs.TryGetValue(info.SessionId, out jobName))
+                        {
+                            info.Source = "Cowork";
+                            if (!string.IsNullOrEmpty(jobName)) info.Title = jobName;
+                        }
+
                         info.IsLive = info.SessionId != null && liveIds.Contains(info.SessionId);
                         results.Add(info);
                     }
@@ -317,12 +660,26 @@ namespace CoworkContextMeter
         private void ScanCowork(List<SessionInfo> results,
             Dictionary<string, string> sharedTranscripts, HashSet<string> claimed)
         {
-            // OLD local-agent-mode-sessions = legacy sandboxed Cowork runs -> "Cowork".
-            // NEW claude-code-sessions = ordinary desktop Claude Code sessions whose
-            // transcripts live in the shared ~/.claude/projects tree -> "Code"
-            // (just enriched with the state file's real title + exact [1m] window).
+            // Label by which storage the session's state file lives in:
+            //   local-agent-mode-sessions = Cowork (local agent mode) sessions.
+            //       These carry legacy-only fields (sessionType, hostLoopMode,
+            //       vmProcessName) and are sandboxed.
+            //   claude-code-sessions      = Claude CODE sessions run from the
+            //       desktop app (this is literally what the folder holds; every
+            //       file in it is structurally identical, so there is NO field
+            //       that separates a "Cowork" one from a "Code" one here).
+            // NOTE: do NOT blanket-label everything with a desktop state file as
+            // Cowork -- that wrongly tags ordinary Claude Code sessions (v1.8 bug).
             ScanCoworkRoot(CoworkSessionsDir, "Cowork", results, sharedTranscripts, claimed);
             ScanCoworkRoot(CoworkSessionsDirNew, "Code", results, sharedTranscripts, claimed);
+
+            // Claude Desktop is an MSIX app: its real data lives in the package
+            // container, which the plain %APPDATA% paths above CANNOT see when
+            // this app runs outside that container (the normal case).
+            foreach (string r in PackageCoworkRoots("local-agent-mode-sessions"))
+                ScanCoworkRoot(r, "Cowork", results, sharedTranscripts, claimed);
+            foreach (string r in PackageCoworkRoots("claude-code-sessions"))
+                ScanCoworkRoot(r, "Code", results, sharedTranscripts, claimed);
         }
 
         /// <summary>
@@ -336,26 +693,59 @@ namespace CoworkContextMeter
         {
             List<SessionInfo> rows = new List<SessionInfo>();
             bool ok = TryScanCoworkRoot(root, source, sharedTranscripts, rows);
-            if (ok)
+            int built = rows.Count; // capture before `rows` may be swapped for the cache
+
+            List<SessionInfo> prev;
+            bool havePrev = _lastCoworkRows.TryGetValue(root, out prev)
+                && prev != null && prev.Count > 0;
+
+            if (ok && rows.Count > 0)
             {
                 _lastCoworkRows[root] = rows;
+                SaveCoworkCache();           // remember across restarts
+            }
+            else if (ok && havePrev)
+            {
+                // A clean enumeration that suddenly yields nothing, while we had
+                // rows moments ago, is almost always a folder still settling
+                // (e.g. just after a Desktop update) -- keep the last known set.
+                rows = prev;
+                StaleCoworkShown = true;
+            }
+            else if (ok)
+            {
+                // Genuinely empty and nothing known before. Do NOT store the empty
+                // list: that would make havePrev false forever and permanently
+                // poison the fallback for this process. Leave the key absent so a
+                // later cache load or a good scan can still populate it.
+            }
+            else if (havePrev)
+            {
+                rows = prev;                 // enumeration failed -> stale-beats-empty
+                StaleCoworkShown = true;
             }
             else
             {
-                List<SessionInfo> prev;
-                if (_lastCoworkRows.TryGetValue(root, out prev) && prev != null && prev.Count > 0)
-                {
-                    rows = prev;             // stale-beats-empty
-                    StaleCoworkShown = true;
-                }
-                else
-                {
-                    rows = new List<SessionInfo>(); // nothing known yet -> honest empty
-                }
+                rows = new List<SessionInfo>(); // failed and nothing known -> honest empty
+            }
+
+            // Only log when something is off, so the normal 5 s cadence stays quiet.
+            if (!ok || rows.Count == 0 || StaleCoworkShown)
+            {
+                bool exists = false;
+                try { exists = Directory.Exists(Lp(root)); } catch { }
+                ScanLog("root=" + LeafName(root) + " exists=" + exists + " enumOk=" + ok
+                    + " built=" + built + " prevCached=" + (havePrev ? prev.Count : 0)
+                    + " used=" + rows.Count + " stale=" + StaleCoworkShown);
             }
 
             foreach (SessionInfo info in rows)
             {
+                // The same session can surface from two roots (e.g. the plain
+                // %APPDATA% path and the MSIX package path resolve to the same
+                // data when running inside the container) -- never list it twice.
+                if (!string.IsNullOrEmpty(info.SessionId) && claimed.Contains(info.SessionId))
+                    continue;
                 results.Add(info);
                 if (!string.IsNullOrEmpty(info.SessionId))
                     claimed.Add(info.SessionId);
@@ -371,26 +761,26 @@ namespace CoworkContextMeter
         private bool TryScanCoworkRoot(string root, string source,
             Dictionary<string, string> sharedTranscripts, List<SessionInfo> rows)
         {
-            try { if (!Directory.Exists(Lp(root))) return false; }
-            catch { return false; }
+            try { if (!Directory.Exists(Lp(root))) { ScanLog("enum: root not found " + root); return false; } }
+            catch (Exception ex) { ScanLog("enum: Exists threw " + ex.GetType().Name + ": " + ex.Message); return false; }
 
             string[] wsDirs;
             try { wsDirs = Directory.GetDirectories(Lp(root)); }
-            catch { return false; }
+            catch (Exception ex) { ScanLog("enum: workspaces threw " + ex.GetType().Name + ": " + ex.Message); return false; }
 
             foreach (string wsRaw in wsDirs)
             {
                 string ws = StripLp(wsRaw);
                 string[] containers;
                 try { containers = Directory.GetDirectories(Lp(ws)); }
-                catch { return false; }    // transient -> fail whole root, keep last good
+                catch (Exception ex) { ScanLog("enum: containers threw " + ex.GetType().Name + ": " + ex.Message); return false; }
 
                 foreach (string contRaw in containers)
                 {
                     string cont = StripLp(contRaw);
                     string[] stateFiles;
                     try { stateFiles = Directory.GetFiles(Lp(cont), "local_*.json"); }
-                    catch { return false; }
+                    catch (Exception ex) { ScanLog("enum: stateFiles threw " + ex.GetType().Name + ": " + ex.Message); return false; }
 
                     foreach (string sfRaw in stateFiles)
                     {
@@ -459,9 +849,7 @@ namespace CoworkContextMeter
 
             // the state file records the [1m] 1M-window marker that transcripts lack
             if (!string.IsNullOrEmpty(st.Model)) info.Model = st.Model; // verbatim, keep "[1m]"
-            info.WindowOverride =
-                (info.Model != null && info.Model.IndexOf("[1m]", StringComparison.Ordinal) >= 0)
-                ? 1000000L : 0L;
+            info.WindowOverride = CoworkWindowFor(info.Model);
 
             string title = TrimTitle(st.Title);
             if (string.IsNullOrEmpty(title)) title = TrimTitle(st.InitialMessage);

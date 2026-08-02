@@ -1,4 +1,4 @@
-// App.cs - WinForms UI for Cowork Context Meter.
+﻿// App.cs - WinForms UI for Cowork Context Meter.
 // Compiled with .NET Framework 4 csc.exe -- C# 5 syntax only.
 
 using System;
@@ -68,7 +68,7 @@ namespace CoworkContextMeter
 
         public MainForm()
         {
-            Text = "Cowork Context Meter";
+            Text = AppTitle();
             Font = new Font("Segoe UI", 9f);
             _boldFont = new Font("Segoe UI", 9f, FontStyle.Bold);
             ClientSize = new Size(1050, 620);
@@ -260,13 +260,22 @@ namespace CoworkContextMeter
                 bool first = _firstScan;
                 _firstScan = false;
                 Stopwatch sw = Stopwatch.StartNew();
-                // First scan retries if a Cowork folder is present but empty
-                // (folder still settling just after a PC restart / Desktop
-                // launch); auto-refresh ticks use the plain, non-blocking scan.
-                try { list = first ? _scanner.ScanResilient(10, 500) : _scanner.Scan(); }
-                catch (Exception ex) { error = ex.Message; }
+                DebugLog("scan start first=" + first);
+                // Plain, NON-BLOCKING scan. The Scanner's on-disk cache already
+                // covers a cold start while the folders are still settling, so we
+                // must not sleep/retry here: that delayed the first render for
+                // tens of seconds AND starved the 5 s auto-refresh, because
+                // _scanning stayed true the whole time (grid rendered nothing).
+                try { list = _scanner.Scan(); }
+                catch (Exception ex) { error = ex.ToString(); }
                 sw.Stop();
                 long ms = sw.ElapsedMilliseconds;
+                if (error != null)
+                    DebugLog("scan ERROR after " + ms + "ms: "
+                        + error.Replace("\r", " ").Replace("\n", " | "));
+                else
+                    DebugLog("scan ok " + ms + "ms total=" + (list == null ? -1 : list.Count)
+                        + " cowork=" + CountCowork(list) + " stale=" + _scanner.StaleCoworkShown);
 
                 try
                 {
@@ -275,7 +284,9 @@ namespace CoworkContextMeter
                         _scanning = false;
                         if (error != null)
                         {
-                            _statusLabel.Text = "Scan error: " + error;
+                            // Keep the rows we already show -- one failed scan must
+                            // never blank the list. Auto-refresh retries in 5 s.
+                            _statusLabel.Text = "Scan error (will retry): " + FirstLine(error);
                             return;
                         }
                         _all = list;
@@ -329,70 +340,90 @@ namespace CoworkContextMeter
             int firstVisible = -1;
             try { firstVisible = _grid.FirstDisplayedScrollingRowIndex; } catch { }
 
+            int rendered = 0, skipped = 0;
             _grid.SuspendLayout();
-            _grid.Rows.Clear();
-            foreach (SessionInfo s in rows)
+            try
             {
-                int idx = _grid.Rows.Add();
-                DataGridViewRow row = _grid.Rows[idx];
-                row.Tag = s;
-
-                string title = s.Title;
-                if (string.IsNullOrEmpty(title)) title = s.SessionId ?? "";
-                if (s.IsLive)
+                _grid.Rows.Clear();
+                foreach (SessionInfo s in rows)
                 {
-                    title = LivePrefix + title;
-                    row.DefaultCellStyle.Font = _boldFont;
-                }
-                row.Cells[ColSession].Value = title;
-                row.Cells[ColSource].Value = s.Source ?? "Code";
-                row.Cells[ColProject].Value = s.ProjectName ?? "";
-                row.Cells[ColActivity].Value =
-                    s.LastActivityUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture);
-                row.Cells[ColModel].Value = s.Model ?? "";
-                if (s.HasUsage)
-                {
-                    row.Cells[ColTokens].Value =
-                        s.TotalContextTokens.ToString("N0", CultureInfo.CurrentCulture);
-                    row.Cells[ColPercent].Value =
-                        PercentOf(s).ToString("0.0", CultureInfo.CurrentCulture) + "%";
-                }
-                else
-                {
-                    row.Cells[ColTokens].Value = "";
-                    row.Cells[ColPercent].Value = "";
-                }
-            }
-
-            // sort glyphs
-            for (int i = 0; i < _grid.Columns.Count; i++)
-                _grid.Columns[i].HeaderCell.SortGlyphDirection = SortOrder.None;
-            _grid.Columns[_sortColumn].HeaderCell.SortGlyphDirection =
-                _sortAsc ? SortOrder.Ascending : SortOrder.Descending;
-
-            // restore selection and scroll position
-            if (selectedId != null)
-            {
-                foreach (DataGridViewRow row in _grid.Rows)
-                {
-                    SessionInfo s = row.Tag as SessionInfo;
-                    if (s != null && s.SessionId == selectedId)
+                    try
                     {
-                        // Re-establish CurrentCell as well as Selected so the
-                        // current row tracks the user's row instead of staying
-                        // on the auto-assigned row 0.
-                        try { _grid.CurrentCell = row.Cells[ColSession]; }
-                        catch { }
-                        row.Selected = true;
-                        break;
+                        int idx = _grid.Rows.Add();
+                        DataGridViewRow row = _grid.Rows[idx];
+                        row.Tag = s;
+
+                        string title = s.Title;
+                        if (string.IsNullOrEmpty(title)) title = s.SessionId ?? "";
+                        if (s.IsLive)
+                        {
+                            title = LivePrefix + title;
+                            row.DefaultCellStyle.Font = _boldFont;
+                        }
+                        row.Cells[ColSession].Value = title;
+                        row.Cells[ColSource].Value = s.Source ?? "Code";
+                        row.Cells[ColProject].Value = s.ProjectName ?? "";
+                        row.Cells[ColActivity].Value = FmtLocal(s.LastActivityUtc);
+                        row.Cells[ColModel].Value = s.Model ?? "";
+                        if (s.HasUsage)
+                        {
+                            row.Cells[ColTokens].Value =
+                                s.TotalContextTokens.ToString("N0", CultureInfo.CurrentCulture);
+                            row.Cells[ColPercent].Value =
+                                PercentOf(s).ToString("0.0", CultureInfo.CurrentCulture) + "%";
+                        }
+                        else
+                        {
+                            row.Cells[ColTokens].Value = "";
+                            row.Cells[ColPercent].Value = "";
+                        }
+                        rendered++;
+                    }
+                    catch
+                    {
+                        // A single malformed session must NEVER blank the grid.
+                        skipped++;
                     }
                 }
+
+                // sort glyphs
+                for (int i = 0; i < _grid.Columns.Count; i++)
+                    _grid.Columns[i].HeaderCell.SortGlyphDirection = SortOrder.None;
+                _grid.Columns[_sortColumn].HeaderCell.SortGlyphDirection =
+                    _sortAsc ? SortOrder.Ascending : SortOrder.Descending;
+
+                // restore selection and scroll position
+                if (selectedId != null)
+                {
+                    foreach (DataGridViewRow row in _grid.Rows)
+                    {
+                        SessionInfo s = row.Tag as SessionInfo;
+                        if (s != null && s.SessionId == selectedId)
+                        {
+                            // Re-establish CurrentCell as well as Selected so the
+                            // current row tracks the user's row instead of staying
+                            // on the auto-assigned row 0.
+                            try { _grid.CurrentCell = row.Cells[ColSession]; }
+                            catch { }
+                            row.Selected = true;
+                            break;
+                        }
+                    }
+                }
+                if (firstVisible >= 0 && firstVisible < _grid.Rows.Count)
+                {
+                    try { _grid.FirstDisplayedScrollingRowIndex = firstVisible; } catch { }
+                }
             }
-            if (firstVisible >= 0 && firstVisible < _grid.Rows.Count)
+            finally
             {
-                try { _grid.FirstDisplayedScrollingRowIndex = firstVisible; } catch { }
+                _grid.ResumeLayout(); // always runs, even if a row threw
             }
-            _grid.ResumeLayout();
+
+            DebugLog("rebuild all=" + _all.Count + " coworkAll=" + CountCowork(_all)
+                + " filtered=" + rows.Count + " rendered=" + rendered + " skipped=" + skipped
+                + " q='" + q + "' hideEmpty=" + _chkHideEmpty.Checked
+                + " hideArch=" + _chkHideArchived.Checked);
 
             UpdateStatus(rows.Count);
         }
@@ -437,6 +468,104 @@ namespace CoworkContextMeter
             });
         }
 
+        // Local-time formatting that can never throw: ToLocalTime() overflows
+        // for near-min/max timestamps in some time zones, which (unguarded)
+        // would abort the whole grid rebuild and blank the list.
+        private static string FmtLocal(DateTime utc)
+        {
+            try { return utc.ToLocalTime().ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture); }
+            catch { return utc.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture); }
+        }
+
+        /// <summary>
+        /// Version of this build. BUMP THIS whenever the app changes.
+        /// v2.2 = surface-aware context window for Cowork sessions. Cowork runs
+        ///        a SMALLER window than other surfaces (claude-sonnet-5:
+        ///        500,000 on Cowork vs 967,000 elsewhere), so a Cowork session
+        ///        previously assumed 200k and displayed over 100% once it
+        ///        passed 200,000 tokens. Auto-compaction fires at
+        ///        (window - 33,000), so the amber/red bands now land where
+        ///        they are actually useful.
+        ///        NOTE: v2.1 (unreleased) also read Claude Desktop's HTTP cache
+        ///        to recover CLOUD Cowork sessions. That is deliberately NOT in
+        ///        v2.2: reading another app's browser cache is the behavioural
+        ///        signature of an infostealer and was quarantined by antivirus,
+        ///        it only ever worked ~2 attempts in 9, and it is unnecessary --
+        ///        Cowork sessions run with cloud DISABLED write a normal
+        ///        transcript and are read exactly and reliably.
+        /// v2.0 = recognise daemon-run Cowork jobs (~/.claude/jobs/*/state.json):
+        ///        label them "Cowork" and use the job's real name as the title.
+        ///        Previously they looked like plain "Code" rows.
+        /// v1.9 = revert v1.8's blanket relabel: claude-code-sessions holds real
+        ///        Claude CODE sessions, so it is "Code" again (v1.8 wrongly
+        ///        tagged the user's own Code sessions as Cowork).
+        /// v1.8 = every Claude DESKTOP session counts as "Cowork" (both storage
+        ///        generations); "Code" now means a pure command-line session.
+        /// v1.7 = scan Claude Desktop's MSIX package container (the real home of
+        ///        the Cowork session data) instead of only the plain %APPDATA%.
+        /// </summary>
+        private const string AppVersion = "v2.2";
+
+        /// <summary>
+        /// Window title: name + version + when this exe was actually built, so
+        /// which build you are looking at is never a guess. The timestamp comes
+        /// from the exe's own file time, so it can't go stale.
+        /// </summary>
+        private static string AppTitle()
+        {
+            string stamp = "unknown";
+            try
+            {
+                string exe = Assembly.GetExecutingAssembly().Location;
+                if (!string.IsNullOrEmpty(exe) && System.IO.File.Exists(exe))
+                    stamp = System.IO.File.GetLastWriteTime(exe)
+                        .ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture);
+            }
+            catch { }
+            return "Cowork Context Meter " + AppVersion + "  -  updated " + stamp;
+        }
+
+        private static string FirstLine(string s)
+        {
+            if (string.IsNullOrEmpty(s)) return "";
+            int i = s.IndexOfAny(new char[] { '\r', '\n' });
+            return i > 0 ? s.Substring(0, i) : s;
+        }
+
+        private static int CountCowork(List<SessionInfo> list)
+        {
+            int n = 0;
+            if (list != null)
+                foreach (SessionInfo s in list)
+                    if (s != null && s.Source == "Cowork") n++;
+            return n;
+        }
+
+        // Small rolling black-box log so a recurrence of "no Cowork shown" is
+        // provable (what the scan produced vs what was rendered) instead of a
+        // guess. Never throws.
+        private static void DebugLog(string msg)
+        {
+            try
+            {
+                string dir = System.IO.Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "CoworkContextMeter");
+                if (!System.IO.Directory.Exists(dir)) System.IO.Directory.CreateDirectory(dir);
+                string path = System.IO.Path.Combine(dir, "ui-debug.log");
+                try
+                {
+                    System.IO.FileInfo fi = new System.IO.FileInfo(path);
+                    if (fi.Exists && fi.Length > 262144) System.IO.File.Delete(path);
+                }
+                catch { }
+                System.IO.File.AppendAllText(path,
+                    DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture)
+                    + "  " + msg + Environment.NewLine);
+            }
+            catch { }
+        }
+
         private void UpdateStatus(int shown)
         {
             string text;
@@ -453,7 +582,7 @@ namespace CoworkContextMeter
                     shown, _all.Count, Dot, _lastScanMs, _scanner.ProjectsDir);
             }
             if (_scanner.StaleCoworkShown)
-                text += Dot + "⚠ Cowork folder busy — showing last known";
+                text += Dot + "âš  Cowork folder busy â€” showing last known";
             _statusLabel.Text = text;
         }
 
@@ -747,3 +876,4 @@ namespace CoworkContextMeter
         }
     }
 }
+
