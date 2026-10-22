@@ -66,10 +66,19 @@ namespace CoworkContextMeter
         private bool _sortAsc = false;
         private long _lastScanMs;
 
+        private NotifyIcon _tray;
+        private ToolStripMenuItem _trayOverlayItem;
+        private OverlayForm _overlay;
+        private HashSet<string> _pinned;
+        private const string PinPrefix = "★ ";
+
         public MainForm()
         {
             Text = AppTitle();
             Font = new Font("Segoe UI", 9f);
+            BackColor = Theme.Bg;
+            ForeColor = Theme.Fg;
+            HandleCreated += delegate { Theme.DarkTitleBar(Handle); };
             _boldFont = new Font("Segoe UI", 9f, FontStyle.Bold);
             ClientSize = new Size(1050, 620);
             MinimumSize = new Size(720, 400);
@@ -86,6 +95,220 @@ namespace CoworkContextMeter
             _timer.Enabled = _chkAuto.Checked;
 
             Shown += delegate { StartScan(); };
+
+            _pinned = LoadPinned();
+            _grid.ContextMenuStrip = BuildGridMenu();
+            _grid.CellMouseDown += delegate(object sender, DataGridViewCellMouseEventArgs e)
+            {
+                // right-click selects the row the menu will act on
+                if (e.Button == MouseButtons.Right && e.RowIndex >= 0)
+                {
+                    try { _grid.CurrentCell = _grid.Rows[e.RowIndex].Cells[ColSession]; } catch { }
+                    _grid.Rows[e.RowIndex].Selected = true;
+                }
+            };
+
+            _overlay = new OverlayForm();
+            _overlay.Location = LoadOverlayPos();
+            _overlay.ContextMenuStrip = BuildOverlayMenu();
+            _overlay.Show();
+
+            BuildTray();
+            Resize += delegate { if (WindowState == FormWindowState.Minimized) Hide(); };
+            FormClosing += delegate
+            {
+                SaveOverlayPos(_overlay.Location);
+                _tray.Visible = false; // else a dead icon lingers in the tray
+            };
+        }
+
+        // ----- tray + overlay ----------------------------------------------
+
+        private void BuildTray()
+        {
+            ContextMenuStrip menu = new ContextMenuStrip();
+            menu.Items.Add("Open meter", null, delegate { RestoreFromTray(); });
+            _trayOverlayItem = new ToolStripMenuItem("Show overlay");
+            _trayOverlayItem.Checked = true;
+            _trayOverlayItem.Click += delegate
+            {
+                _trayOverlayItem.Checked = !_trayOverlayItem.Checked;
+                _overlay.Visible = _trayOverlayItem.Checked;
+            };
+            menu.Items.Add(_trayOverlayItem);
+            menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add("Exit", null, delegate { Close(); });
+
+            _tray = new NotifyIcon();
+            _tray.Icon = Icon;
+            _tray.Text = "Cowork Context Meter " + AppVersion;
+            _tray.ContextMenuStrip = menu;
+            _tray.DoubleClick += delegate { RestoreFromTray(); };
+            _tray.Visible = true;
+        }
+
+        private void RestoreFromTray()
+        {
+            Show();
+            if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
+            Activate();
+        }
+
+        private ContextMenuStrip BuildGridMenu()
+        {
+            ContextMenuStrip menu = new ContextMenuStrip();
+            ToolStripMenuItem pin = new ToolStripMenuItem("Pin to overlay");
+            pin.Click += delegate
+            {
+                SessionInfo s = SelectedSession();
+                if (s != null) TogglePin(s.SessionId);
+            };
+            menu.Items.Add(pin);
+            menu.Opening += delegate(object sender, System.ComponentModel.CancelEventArgs e)
+            {
+                SessionInfo s = SelectedSession();
+                if (s == null) { e.Cancel = true; return; }
+                pin.Text = _pinned.Contains(s.SessionId) ? "Unpin from overlay" : "Pin to overlay";
+            };
+            return menu;
+        }
+
+        private void TogglePin(string id)
+        {
+            if (id == null) return;
+            if (!_pinned.Remove(id)) _pinned.Add(id);
+            SavePinned();
+            RebuildRows();
+        }
+
+        /// <summary>
+        /// Right-click menu on the overlay itself: the 15 most recent Claude Code
+        /// sessions (live first by recency), checked = pinned. Rebuilt on every
+        /// open so it always reflects the latest scan.
+        /// </summary>
+        private ContextMenuStrip BuildOverlayMenu()
+        {
+            ContextMenuStrip menu = new ContextMenuStrip();
+            menu.Items.Add("(loading)"); // an empty strip refuses to open
+            menu.Opening += delegate
+            {
+                menu.Items.Clear();
+                List<SessionInfo> code = new List<SessionInfo>();
+                foreach (SessionInfo s in _all)
+                    if (s != null && s.SessionId != null && s.HasUsage && s.Source == "Code")
+                        code.Add(s);
+                code.Sort(delegate(SessionInfo a, SessionInfo b)
+                {
+                    return b.LastActivityUtc.CompareTo(a.LastActivityUtc);
+                });
+
+                ToolStripMenuItem hdr = new ToolStripMenuItem("Pin Claude Code sessions:");
+                hdr.Enabled = false;
+                menu.Items.Add(hdr);
+                for (int i = 0; i < code.Count && i < 15; i++)
+                {
+                    SessionInfo s = code[i];
+                    string id = s.SessionId;
+                    string name = string.IsNullOrEmpty(s.Title) ? id : s.Title;
+                    if (name.Length > 55) name = name.Substring(0, 55) + "...";
+                    ToolStripMenuItem it = new ToolStripMenuItem(
+                        (s.IsLive ? "● " : "") + name + "   "
+                        + PercentOf(s).ToString("0", CultureInfo.CurrentCulture) + "%");
+                    it.Checked = _pinned.Contains(id);
+                    it.Click += delegate { TogglePin(id); };
+                    menu.Items.Add(it);
+                }
+                if (code.Count == 0) menu.Items.Add("(no Claude Code sessions found)").Enabled = false;
+
+                menu.Items.Add(new ToolStripSeparator());
+                menu.Items.Add("Open meter", null, delegate { RestoreFromTray(); });
+                menu.Items.Add("Hide overlay", null, delegate
+                {
+                    _trayOverlayItem.Checked = false;
+                    _overlay.Visible = false;
+                });
+                menu.Items.Add("Exit", null, delegate { Close(); });
+            };
+            return menu;
+        }
+
+        private SessionInfo SelectedSession()
+        {
+            if (_grid.SelectedRows.Count == 0) return null;
+            return _grid.SelectedRows[0].Tag as SessionInfo;
+        }
+
+        /// <summary>Push the pinned sessions (current numbers) to the overlay + tray tooltip.</summary>
+        private void UpdateOverlay()
+        {
+            List<OverlayForm.Line> lines = new List<OverlayForm.Line>();
+            foreach (SessionInfo s in _all)
+            {
+                if (s == null || s.SessionId == null || !_pinned.Contains(s.SessionId)) continue;
+                OverlayForm.Line l = new OverlayForm.Line();
+                l.Name = string.IsNullOrEmpty(s.Title) ? s.SessionId : s.Title;
+                l.Pct = PercentOf(s);
+                l.Usage = s.HasUsage
+                    ? l.Pct.ToString("0", CultureInfo.CurrentCulture) + "%  "
+                      + (s.TotalContextTokens / 1000).ToString("N0", CultureInfo.CurrentCulture) + "k"
+                    : "--";
+                lines.Add(l);
+            }
+            _overlay.SetLines(lines);
+
+            // NotifyIcon.Text is capped at 63 chars on .NET Framework
+            string tip = lines.Count > 0
+                ? lines[0].Usage + "  " + lines[0].Name
+                : "Cowork Context Meter " + AppVersion;
+            _tray.Text = tip.Length > 63 ? tip.Substring(0, 63) : tip;
+        }
+
+        private static string AppDataFile(string name)
+        {
+            string dir = System.IO.Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "CoworkContextMeter");
+            try { System.IO.Directory.CreateDirectory(dir); } catch { }
+            return System.IO.Path.Combine(dir, name);
+        }
+
+        private static HashSet<string> LoadPinned()
+        {
+            HashSet<string> set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            try
+            {
+                foreach (string line in System.IO.File.ReadAllLines(AppDataFile("pinned.txt")))
+                    if (line.Trim().Length > 0) set.Add(line.Trim());
+            }
+            catch { }
+            return set;
+        }
+
+        private void SavePinned()
+        {
+            try { System.IO.File.WriteAllLines(AppDataFile("pinned.txt"), new List<string>(_pinned).ToArray()); }
+            catch { }
+        }
+
+        private static Point LoadOverlayPos()
+        {
+            try
+            {
+                string[] p = System.IO.File.ReadAllText(AppDataFile("overlay-pos.txt")).Split(',');
+                Point pt = new Point(int.Parse(p[0]), int.Parse(p[1]));
+                // only reuse if still on a connected screen
+                foreach (Screen sc in Screen.AllScreens)
+                    if (sc.WorkingArea.Contains(pt)) return pt;
+            }
+            catch { }
+            Rectangle wa = Screen.PrimaryScreen.WorkingArea;
+            return new Point(wa.Right - 340, wa.Top + 20);
+        }
+
+        private static void SaveOverlayPos(Point p)
+        {
+            try { System.IO.File.WriteAllText(AppDataFile("overlay-pos.txt"), p.X + "," + p.Y); }
+            catch { }
         }
 
         // ----- UI construction ---------------------------------------------
@@ -166,6 +389,7 @@ namespace CoworkContextMeter
             panel.Controls.Add(_txtSearch);
             panel.Controls.Add(_chkHideEmpty);
             panel.Controls.Add(_chkHideArchived);
+            Theme.StyleToolbar(panel);
             return panel;
         }
 
@@ -182,10 +406,9 @@ namespace CoworkContextMeter
             grid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
             grid.MultiSelect = false;
             grid.AutoGenerateColumns = false;
-            grid.BackgroundColor = SystemColors.Window;
             grid.BorderStyle = BorderStyle.None;
             grid.CellBorderStyle = DataGridViewCellBorderStyle.SingleHorizontal;
-            grid.GridColor = Color.FromArgb(230, 230, 230);
+            Theme.StyleGrid(grid);
             grid.ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.AutoSize;
             grid.StandardTab = true;
 
@@ -243,6 +466,9 @@ namespace CoworkContextMeter
             _statusLabel.TextAlign = ContentAlignment.MiddleLeft;
             _statusLabel.Text = "Starting...";
             strip.Items.Add(_statusLabel);
+            strip.RenderMode = ToolStripRenderMode.System;
+            strip.BackColor = Theme.Card;
+            _statusLabel.ForeColor = Theme.FgMuted;
             return strip;
         }
 
@@ -355,6 +581,7 @@ namespace CoworkContextMeter
 
                         string title = s.Title;
                         if (string.IsNullOrEmpty(title)) title = s.SessionId ?? "";
+                        if (_pinned.Contains(s.SessionId ?? "")) title = PinPrefix + title;
                         if (s.IsLive)
                         {
                             title = LivePrefix + title;
@@ -426,6 +653,7 @@ namespace CoworkContextMeter
                 + " hideArch=" + _chkHideArchived.Checked);
 
             UpdateStatus(rows.Count);
+            UpdateOverlay();
         }
 
         private void SortRows(List<SessionInfo> rows)
@@ -479,6 +707,15 @@ namespace CoworkContextMeter
 
         /// <summary>
         /// Version of this build. BUMP THIS whenever the app changes.
+        /// v2.5 = dark slate theme (UI UX Pro Max "Dark Mode (OLED)" palette):
+        ///        dark title bar, flat toolbar, dark grid, slim % bars with the
+        ///        number beside them; overlay gets rounded corners + per-row bar.
+        /// v2.4 = right-click the OVERLAY to pin/unpin from the 15 most recent
+        ///        Claude Code sessions (Cowork has merged into chat).
+        /// v2.3 = system-tray icon (minimise hides to tray) + always-on-top
+        ///        translucent overlay showing only PINNED sessions (right-click a
+        ///        row > Pin to overlay). Pins and overlay position persist in
+        ///        %LOCALAPPDATA%CoworkContextMeter.
         /// v2.2 = surface-aware context window for Cowork sessions. Cowork runs
         ///        a SMALLER window than other surfaces (claude-sonnet-5:
         ///        500,000 on Cowork vs 967,000 elsewhere), so a Cowork session
@@ -504,7 +741,7 @@ namespace CoworkContextMeter
         /// v1.7 = scan Claude Desktop's MSIX package container (the real home of
         ///        the Cowork session data) instead of only the plain %APPDATA%.
         /// </summary>
-        private const string AppVersion = "v2.2";
+        private const string AppVersion = "v2.5";
 
         /// <summary>
         /// Window title: name + version + when this exe was actually built, so
@@ -647,36 +884,21 @@ namespace CoworkContextMeter
             if (clamped > 100.0) clamped = 100.0;
             if (clamped < 0.0) clamped = 0.0;
 
-            Rectangle bar = new Rectangle(
-                e.CellBounds.X + 4, e.CellBounds.Y + 4,
-                e.CellBounds.Width - 9, e.CellBounds.Height - 9);
-            if (bar.Width > 2 && bar.Height > 2)
+            Rectangle cell = e.CellBounds;
+            string txt = pct.ToString("0.0", CultureInfo.CurrentCulture) + "%";
+            TextRenderer.DrawText(e.Graphics, txt, e.CellStyle.Font,
+                new Rectangle(cell.X + 6, cell.Y, 52, cell.Height), Theme.Fg,
+                TextFormatFlags.Right | TextFormatFlags.VerticalCenter);
+            Rectangle track = new Rectangle(cell.X + 64, cell.Y + cell.Height / 2 - 3,
+                cell.Width - 72, 6);
+            if (track.Width > 4)
             {
-                Color barColor;
-                if (pct > 80.0) barColor = Color.FromArgb(217, 58, 50);        // red
-                else if (pct >= 60.0) barColor = Color.FromArgb(240, 160, 20); // amber
-                else barColor = Color.FromArgb(76, 165, 80);                   // green
-
-                using (SolidBrush back = new SolidBrush(Color.FromArgb(235, 235, 235)))
-                {
-                    e.Graphics.FillRectangle(back, bar);
-                }
-                int w = (int)Math.Round(bar.Width * clamped / 100.0);
+                using (SolidBrush back = new SolidBrush(Theme.Muted))
+                    e.Graphics.FillRectangle(back, track);
+                int w = (int)Math.Round(track.Width * clamped / 100.0);
                 if (w > 0)
-                {
-                    using (SolidBrush fill = new SolidBrush(barColor))
-                    {
-                        e.Graphics.FillRectangle(fill, new Rectangle(bar.X, bar.Y, w, bar.Height));
-                    }
-                }
-                using (Pen border = new Pen(Color.FromArgb(200, 200, 200)))
-                {
-                    e.Graphics.DrawRectangle(border, bar);
-                }
-                string txt = pct.ToString("0.0", CultureInfo.CurrentCulture) + "%";
-                TextRenderer.DrawText(e.Graphics, txt, e.CellStyle.Font, bar,
-                    Color.FromArgb(20, 20, 20),
-                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
+                    using (SolidBrush fill = new SolidBrush(Theme.ForPct(pct)))
+                        e.Graphics.FillRectangle(fill, new Rectangle(track.X, track.Y, w, track.Height));
             }
             e.Handled = true;
         }
@@ -875,5 +1097,204 @@ namespace CoworkContextMeter
             return string.Format(CultureInfo.CurrentCulture, "{0:N0} bytes", bytes);
         }
     }
-}
 
+    /// <summary>
+    /// Small borderless, always-on-top, semi-transparent panel listing only the
+    /// pinned sessions: name + context used. Drag anywhere to move it.
+    /// </summary>
+    public class OverlayForm : Form
+    {
+        public class Line
+        {
+            public string Name;
+            public string Usage;
+            public double Pct;
+        }
+
+        [DllImport("user32.dll")]
+        private static extern bool ReleaseCapture();
+        [DllImport("user32.dll")]
+        private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+
+        private const int RowH = 30;
+        private List<Line> _lines = new List<Line>();
+        private readonly Font _bold = new Font("Segoe UI", 9f, FontStyle.Bold);
+
+        public OverlayForm()
+        {
+            FormBorderStyle = FormBorderStyle.None;
+            ShowInTaskbar = false;
+            TopMost = true;
+            StartPosition = FormStartPosition.Manual;
+            BackColor = Theme.Bg;
+            Opacity = 0.85;
+            Font = new Font("Segoe UI", 9f);
+            DoubleBuffered = true;
+            Size = new Size(320, RowH + 10);
+            // drag: pretend the click landed on a title bar
+            MouseDown += delegate(object sender, MouseEventArgs e)
+            {
+                if (e.Button != MouseButtons.Left) return;
+                ReleaseCapture();
+                SendMessage(Handle, 0xA1 /* WM_NCLBUTTONDOWN */, (IntPtr)2 /* HTCAPTION */, IntPtr.Zero);
+            };
+        }
+
+        // tool window: no Alt-Tab entry; never steal focus when shown
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                CreateParams cp = base.CreateParams;
+                cp.ExStyle |= 0x80 /* WS_EX_TOOLWINDOW */ | 0x08000000 /* WS_EX_NOACTIVATE */;
+                return cp;
+            }
+        }
+
+        protected override bool ShowWithoutActivation { get { return true; } }
+
+        protected override void OnHandleCreated(EventArgs e)
+        {
+            base.OnHandleCreated(e);
+            Theme.RoundCorners(Handle);
+        }
+
+        public void SetLines(List<Line> lines)
+        {
+            _lines = lines ?? new List<Line>();
+            int h = Math.Max(1, _lines.Count) * RowH + 10;
+            if (Height != h) Height = h;
+            Invalidate();
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            Graphics g = e.Graphics;
+            if (_lines.Count == 0)
+            {
+                TextRenderer.DrawText(g, "Right-click a session → Pin to overlay", Font,
+                    new Rectangle(10, 5, Width - 20, RowH), Color.Silver,
+                    TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+                return;
+            }
+            const int usageW = 110;
+            int y = 5;
+            foreach (Line l in _lines)
+            {
+                Color c = Theme.ForPct(l.Pct);
+                TextRenderer.DrawText(g, l.Name, Font,
+                    new Rectangle(10, y, Width - 20 - usageW, 20), Theme.Fg,
+                    TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis | TextFormatFlags.NoPrefix);
+                TextRenderer.DrawText(g, l.Usage, _bold,
+                    new Rectangle(Width - 10 - usageW, y, usageW, 20), c,
+                    TextFormatFlags.VerticalCenter | TextFormatFlags.Right);
+                // slim progress bar under the line (text above carries the number)
+                Rectangle track = new Rectangle(10, y + 21, Width - 20, 3);
+                using (SolidBrush back = new SolidBrush(Theme.Muted)) g.FillRectangle(back, track);
+                double pct = l.Pct > 100.0 ? 100.0 : (l.Pct < 0.0 ? 0.0 : l.Pct);
+                int w = (int)Math.Round(track.Width * pct / 100.0);
+                if (w > 0) using (SolidBrush fill = new SolidBrush(c))
+                    g.FillRectangle(fill, new Rectangle(track.X, track.Y, w, track.Height));
+                y += RowH;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Dark slate palette from the UI UX Pro Max "Dark Mode (OLED)" design system
+    /// (developer-tool profile). Colour never carries meaning alone: every bar
+    /// also prints its percentage.
+    /// </summary>
+    internal static class Theme
+    {
+        public static readonly Color Bg = Hex(0x0F172A);
+        public static readonly Color Card = Hex(0x1B2336);
+        public static readonly Color Muted = Hex(0x272F42);
+        public static readonly Color Secondary = Hex(0x334155);
+        public static readonly Color Border = Hex(0x475569);
+        public static readonly Color Fg = Hex(0xF8FAFC);
+        public static readonly Color FgMuted = Hex(0x94A3B8);
+        public static readonly Color Green = Hex(0x22C55E);
+        public static readonly Color Amber = Hex(0xF59E0B);
+        public static readonly Color Red = Hex(0xEF4444);
+
+        private static Color Hex(int v)
+        {
+            return Color.FromArgb((v >> 16) & 255, (v >> 8) & 255, v & 255);
+        }
+
+        public static Color ForPct(double pct)
+        {
+            if (pct > 80.0) return Red;
+            if (pct >= 60.0) return Amber;
+            return Green;
+        }
+
+        [DllImport("dwmapi.dll")]
+        private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);
+
+        /// <summary>Dark caption bar (Windows 10 20H1+ / 11). Silently ignored elsewhere.</summary>
+        public static void DarkTitleBar(IntPtr hwnd)
+        {
+            try { int on = 1; DwmSetWindowAttribute(hwnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, ref on, 4); }
+            catch { }
+        }
+
+        /// <summary>Rounded window corners (Windows 11). Silently ignored elsewhere.</summary>
+        public static void RoundCorners(IntPtr hwnd)
+        {
+            try { int round = 2; DwmSetWindowAttribute(hwnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */, ref round, 4); }
+            catch { }
+        }
+
+        public static void StyleToolbar(Control panel)
+        {
+            panel.BackColor = Card;
+            panel.ForeColor = Fg;
+            foreach (Control c in panel.Controls)
+            {
+                Button b = c as Button;
+                if (b != null)
+                {
+                    b.FlatStyle = FlatStyle.Flat;
+                    b.FlatAppearance.BorderColor = Border;
+                    b.BackColor = Secondary;
+                    b.Cursor = Cursors.Hand;
+                }
+                else if (c is TextBox)
+                {
+                    ((TextBox)c).BorderStyle = BorderStyle.FixedSingle;
+                    c.BackColor = Muted;
+                }
+                else if (c is ComboBox)
+                {
+                    ((ComboBox)c).FlatStyle = FlatStyle.Flat; // Flat honours BackColor
+                    c.BackColor = Muted;
+                }
+                else if (c is Label)
+                {
+                    c.ForeColor = FgMuted;
+                }
+            }
+        }
+
+        public static void StyleGrid(DataGridView g)
+        {
+            g.BackgroundColor = Bg;
+            g.GridColor = Muted;
+            g.EnableHeadersVisualStyles = false; // otherwise header colours are ignored
+            g.ColumnHeadersBorderStyle = DataGridViewHeaderBorderStyle.None;
+            g.ColumnHeadersDefaultCellStyle.BackColor = Card;
+            g.ColumnHeadersDefaultCellStyle.ForeColor = FgMuted;
+            g.ColumnHeadersDefaultCellStyle.SelectionBackColor = Card;
+            g.ColumnHeadersDefaultCellStyle.Padding = new Padding(4, 6, 4, 6);
+            g.DefaultCellStyle.BackColor = Bg;
+            g.DefaultCellStyle.ForeColor = Fg;
+            g.DefaultCellStyle.SelectionBackColor = Secondary;
+            g.DefaultCellStyle.SelectionForeColor = Fg;
+            g.DefaultCellStyle.Padding = new Padding(4, 0, 4, 0);
+            g.AlternatingRowsDefaultCellStyle.BackColor = Hex(0x131C2F);
+            g.RowTemplate.Height = 30;
+        }
+    }
+}

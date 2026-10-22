@@ -249,6 +249,25 @@ namespace CoworkContextMeter
             try
             {
                 string lad = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+
+                // Claude Desktop 2.42304+ (seen 2026-10-20) moved its data OUT of
+                // the MSIX container to %LOCALAPPDATA%\Claude-Data\claude_<id>\
+                // and left a ".user-data-left.claude_<id>" marker behind.
+                string moved = Path.Combine(lad, "Claude-Data");
+                if (Directory.Exists(moved))
+                {
+                    try
+                    {
+                        foreach (string dir in Directory.GetDirectories(moved, "claude_*"))
+                        {
+                            string p = Path.Combine(dir, leaf);
+                            try { if (Directory.Exists(Lp(p))) found.Add(p); }
+                            catch { }
+                        }
+                    }
+                    catch { }
+                }
+
                 string pkgs = Path.Combine(lad, "Packages");
                 if (!Directory.Exists(pkgs)) return found;
                 string[] dirs;

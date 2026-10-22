@@ -2,11 +2,50 @@
 
 A standalone Windows app that shows **how much of the context window each of
 your Claude sessions has used** — read straight from the session files Claude
-already writes to disk.
+already writes to disk — so you can **see auto-compaction coming before it
+hits**.
 
-Claude Code has a built-in context counter; the **Claude desktop app doesn't**
-surface one the same way. This fills that gap, showing every session's token
-usage as a sortable list with a colour-coded percentage bar.
+## Why this exists
+
+I use Claude through my **subscription** inside several apps besides Claude
+Code itself — **OpenCode, T3, Pi, Monocode** and others. Some of those native
+apps don't show any context-window meter at all, which makes it really hard to
+manage auto-compaction: you only find out the context is full when the session
+compacts and loses most of its history.
+
+This app fills that gap. It reads the transcripts that Claude writes under
+`%USERPROFILE%\.claude\projects\` and shows every session's live token usage
+as a colour-coded percentage — in a main window, in the **system tray**, and in
+a small **always-on-top overlay** showing only the sessions you pin.
+
+> **Which apps it can see:** any tool that runs Claude through Claude Code /
+> the Claude Agent SDK on this PC, because those write their transcripts to
+> `~/.claude/projects`. If an app talks to the Claude API some other way and
+> writes no transcript there, it won't appear.
+
+## What's new in v2.5
+
+- **System tray icon** — minimise the window and it lives in the tray.
+  Double-click to reopen; right-click for *Open meter / Show overlay / Exit*.
+  The tooltip shows the first pinned session's usage.
+- **Always-on-top overlay** — a small translucent, rounded panel that floats
+  over every window and shows **only the sessions you pin**: name + `52%  520k`,
+  with a slim green / amber / red bar under each. Drag it anywhere; its
+  position is remembered.
+- **Pinning** — right-click the **overlay** to pick from your 15 most recent
+  Claude Code sessions (checkmark = pinned), or right-click a row in the main
+  window → *Pin to overlay*. Pins persist across restarts.
+- **Dark slate theme** — dark title bar, flat toolbar, dark grid, and slim
+  percentage bars with the number beside them (palette from the UI UX Pro Max
+  "Dark Mode (OLED)" design system).
+- **Claude Desktop 2.42304+ support** — Desktop moved its data out of the MSIX
+  package to `%LOCALAPPDATA%\Claude-Data\claude_<id>\`; the meter now looks
+  there first (older locations remain as fallbacks).
+
+*Note: Claude Cowork has since been merged into Claude chat, so the focus of
+the meter is now Claude Code sessions. Older Cowork sessions still show.*
+
+*The screenshot below is from v2.2 (before the dark theme).*
 
 ![Cowork Context Meter v2.2 showing sessions with their source, model, tokens used and percentage of the context window](docs/screenshot.png)
 
@@ -112,6 +151,7 @@ small state file. The app resolves these per Windows user — no fixed paths:
 | Session transcripts | `%USERPROFILE%\.claude\projects\` |
 | Background/daemon jobs | `%USERPROFILE%\.claude\jobs\` |
 | Cowork sessions (local) | `…\Claude\local-agent-mode-sessions\` |
+| Desktop data (2.42304+) | `%LOCALAPPDATA%\Claude-Data\claude_<id>\` |
 | Desktop session state (title, model, `[1m]`) | `…\Claude\claude-code-sessions\` |
 
 A session's current context is the token usage on its **latest assistant
