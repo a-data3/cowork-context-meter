@@ -5,23 +5,23 @@ your Claude sessions has used** — read straight from the session files Claude
 already writes to disk — so you can **see auto-compaction coming before it
 hits**.
 
-## Why this exists
+## Motivation
 
-I use Claude through my **subscription** inside several apps besides Claude
-Code itself — **OpenCode, T3, Pi, Monocode** and others. Some of those native
-apps don't show any context-window meter at all, which makes it really hard to
-manage auto-compaction: you only find out the context is full when the session
-compacts and loses most of its history.
+Many coding agents — **OpenCode, T3 Code, Pi, Monocode** and others — can run
+Claude on a **Claude Pro/Max subscription** (OAuth sign-in) instead of a
+pay-as-you-go API key. Not all of them show how much of the context window a
+session has used, so **auto-compaction tends to arrive without warning** and
+discards most of the session's history.
 
-This app fills that gap. It reads the transcripts that Claude writes under
-`%USERPROFILE%\.claude\projects\` and shows every session's live token usage
-as a colour-coded percentage — in a main window, in the **system tray**, and in
-a small **always-on-top overlay** showing only the sessions you pin.
+Cowork Context Meter provides that missing visibility. It reads the session
+transcripts written to `%USERPROFILE%\.claude\projects\` and shows each
+session's live context usage in a main window, the system tray, and an
+always-on-top overlay for the sessions you pin.
 
-> **Which apps it can see:** any tool that runs Claude through Claude Code /
-> the Claude Agent SDK on this PC, because those write their transcripts to
-> `~/.claude/projects`. If an app talks to the Claude API some other way and
-> writes no transcript there, it won't appear.
+> **Compatibility:** a session appears when the client runs Claude through
+> Claude Code or the Claude Agent SDK on this machine, since those write
+> transcripts to `~/.claude/projects`. Clients that call the API directly
+> without writing transcripts there are not detected.
 
 ## What's new in v2.5
 
